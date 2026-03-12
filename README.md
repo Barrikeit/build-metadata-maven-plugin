@@ -272,13 +272,3 @@ Or permanently in your POM configuration:
 ```
 
 ---
-
-## Changelog
-
-See [CHANGELOG.md](CHANGELOG.md) for the full release history.
-
----
-
-## License
-
-This project is licensed under the [MIT License](LICENSE).
