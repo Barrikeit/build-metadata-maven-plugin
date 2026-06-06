@@ -1,14 +1,16 @@
 package dev.barrikeit.maven;
 
 import java.io.File;
-import java.io.FileWriter;
+import java.io.IOException;
+import java.nio.file.Files;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.security.SecureRandom;
 import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.HexFormat;
-import java.util.Properties;
+import java.util.Map;
+import java.util.TreeMap;
 import java.util.UUID;
 import org.apache.maven.plugin.AbstractMojo;
 import org.apache.maven.plugin.MojoExecutionException;
@@ -17,7 +19,19 @@ import org.apache.maven.plugins.annotations.Mojo;
 import org.apache.maven.plugins.annotations.Parameter;
 import org.apache.maven.project.MavenProject;
 
-/** Mojo to generate build metadata for Maven projects. */
+/**
+ * Generates build metadata (build ID, timestamp, name, version) and:
+ *
+ * <ul>
+ *   <li>injects the values as Maven properties (available to other plugins and resource filtering)
+ *   <li>writes a {@code .properties} file directly into the project's source resources directory so
+ *       the IDE can find it on the classpath without running any Maven phase first
+ * </ul>
+ *
+ * <p>The output file is written with sorted keys and no date comment, so the file content is
+ * deterministic: re-running with the same inputs produces an identical file, avoiding spurious git
+ * diffs when nothing actually changed.
+ */
 @Mojo(name = "generate-build-metadata", defaultPhase = LifecyclePhase.INITIALIZE)
 public class BuildMetadata extends AbstractMojo {
 
@@ -30,49 +44,58 @@ public class BuildMetadata extends AbstractMojo {
   @Parameter(property = "buildMetadata.skip", defaultValue = "false")
   private boolean skip;
 
-  /** Override default application name. Optional. */
+  /** Override default application name. Defaults to {@code project.build.finalName}. */
   @Parameter(property = "appName")
   private String appName;
 
-  /** Override default application version. Optional. */
+  /** Override default application version. Defaults to {@code project.version}. */
   @Parameter(property = "appVersion")
   private String appVersion;
 
-  /** Property name for the build number. */
+  /** Maven property name written for the build ID. */
   @Parameter(property = "buildIdProperty", defaultValue = "buildNumber")
   private String buildIdProperty;
 
-  /** Property name for the build timestamp. */
+  /** Maven property name written for the build timestamp. */
   @Parameter(property = "buildTimestampProperty", defaultValue = "buildTimestamp")
   private String buildTimestampProperty;
 
-  /** Property name for the application name. */
+  /** Maven property name written for the application name. */
   @Parameter(property = "appNameProperty", defaultValue = "appName")
   private String appNameProperty;
 
-  /** Property name for the application version. */
+  /** Maven property name written for the application version. */
   @Parameter(property = "appVersionProperty", defaultValue = "appVersion")
   private String appVersionProperty;
 
   /**
-   * Length of the build number (max 64). If 0, build number is not generated. SHA-256 produces 64
-   * hex characters; values above this are capped.
+   * Length of the build ID in hex characters (1–64). Set to {@code 0} to skip build ID generation.
+   * SHA-256 produces 64 hex chars; values above that are capped.
    */
   @Parameter(property = "buildIdLength", defaultValue = "20")
   private int buildIdLength;
 
-  /** Format for the timestamp. */
+  /** {@link java.text.SimpleDateFormat} pattern for the build timestamp. */
   @Parameter(property = "buildTimestampFormat", defaultValue = "yyyyMMddHHmmssSSS")
   private String buildTimestampFormat;
 
-  /** Generate a properties file in fileDirectory. Default: false */
-  @Parameter(property = "generateFile", defaultValue = "false")
+  /**
+   * Whether to write a {@code .properties} file. Defaults to {@code true}.
+   *
+   * <p>The file is written to {@link #fileDirectory}/{@link #fileName}. By default this is {@code
+   * src/main/resources/build.properties} — a location the IDE already has on its classpath, so the
+   * application can be run directly from the IDE without executing any Maven phase first.
+   */
+  @Parameter(property = "generateFile", defaultValue = "true")
   private boolean generateFile;
 
-  /** Directory for the generated properties file. */
-  @Parameter(
-      property = "fileDirectory",
-      defaultValue = "${project.build.directory}/generated-sources/build-metadata")
+  /**
+   * Directory where the properties file is written.
+   *
+   * <p>Defaults to {@code src/main/resources} so the file is always available to the IDE without a
+   * prior Maven build.
+   */
+  @Parameter(property = "fileDirectory", defaultValue = "${project.basedir}/src/main/resources")
   private String fileDirectory;
 
   /** Name of the generated properties file. */
@@ -86,7 +109,6 @@ public class BuildMetadata extends AbstractMojo {
       return;
     }
 
-    // Validate buildIdLength
     if (buildIdLength < 0) {
       throw new MojoExecutionException("buildIdLength must be >= 0, got: " + buildIdLength);
     }
@@ -96,65 +118,30 @@ public class BuildMetadata extends AbstractMojo {
     }
 
     try {
-      // Compute timestamp
-      Date date = new Date();
-      String timestamp = new SimpleDateFormat(buildTimestampFormat).format(date);
+      String timestamp = new SimpleDateFormat(buildTimestampFormat).format(new Date());
+      String buildNumber = buildIdLength > 0 ? generateBuildNumber(buildIdLength) : null;
 
-      // Compute build number if length > 0
-      String buildNumber = null;
-      if (buildIdLength > 0) {
-        buildNumber = generateBuildNumber(buildIdLength);
-      }
-
-      // Determine name/version
-      String finalAppName = (appName != null && !appName.isBlank()) ? appName : project.getName();
+      String finalAppName =
+          (appName != null && !appName.isBlank()) ? appName : project.getBuild().getFinalName();
       String finalAppVersion =
           (appVersion != null && !appVersion.isBlank()) ? appVersion : project.getVersion();
 
-      // Set properties in Maven project
-      if (buildNumber != null) {
-        project.getProperties().setProperty(buildIdProperty, buildNumber);
-        getLog().debug("Set property " + buildIdProperty + " = " + buildNumber);
-      }
-      project.getProperties().setProperty(buildTimestampProperty, timestamp);
-      getLog().debug("Set property " + buildTimestampProperty + " = " + timestamp);
+      // Collect all entries; use TreeMap for deterministic ordering
+      Map<String, String> entries = new TreeMap<>();
+      if (buildNumber != null) entries.put(buildIdProperty, buildNumber);
+      entries.put(buildTimestampProperty, timestamp);
+      if (finalAppName != null) entries.put(appNameProperty, finalAppName);
+      if (finalAppVersion != null) entries.put(appVersionProperty, finalAppVersion);
 
-      if (finalAppName != null) {
-        project.getProperties().setProperty(appNameProperty, finalAppName);
-        getLog().debug("Set property " + appNameProperty + " = " + finalAppName);
-      }
-      if (finalAppVersion != null) {
-        project.getProperties().setProperty(appVersionProperty, finalAppVersion);
-        getLog().debug("Set property " + appVersionProperty + " = " + finalAppVersion);
-      }
+      // Inject into Maven property space (used by banner plugin and resource filtering)
+      entries.forEach(
+          (k, v) -> {
+            project.getProperties().setProperty(k, v);
+            getLog().debug("Set Maven property " + k + " = " + v);
+          });
 
-      // Optionally write to file
       if (generateFile) {
-        File outputDir = new File(fileDirectory);
-        if (!outputDir.exists() && !outputDir.mkdirs()) {
-          throw new MojoExecutionException(
-              "Failed to create output directory: " + outputDir.getAbsolutePath());
-        }
-
-        File outputFile = new File(outputDir, fileName);
-        Properties fileProps = new Properties();
-
-        // Only include buildNumber entry if it was generated
-        if (buildNumber != null) {
-          fileProps.setProperty(buildIdProperty, buildNumber);
-        }
-        fileProps.setProperty(buildTimestampProperty, timestamp);
-        if (finalAppName != null) {
-          fileProps.setProperty(appNameProperty, finalAppName);
-        }
-        if (finalAppVersion != null) {
-          fileProps.setProperty(appVersionProperty, finalAppVersion);
-        }
-
-        try (FileWriter writer = new FileWriter(outputFile)) {
-          fileProps.store(writer, "Created by build system. Do not modify.");
-        }
-        getLog().info("Build metadata written to " + outputFile.getAbsolutePath());
+        writePropertiesFile(entries);
       }
 
       getLog().info("Build metadata generated successfully");
@@ -167,13 +154,38 @@ public class BuildMetadata extends AbstractMojo {
   }
 
   /**
-   * Generates a unique build number by hashing a combination of the current timestamp, a random
-   * UUID, and the project artifactId using SHA-256.
-   *
-   * @param length number of hex characters to return (1–64)
-   * @return hex string of the requested length
+   * Writes the entries as a {@code .properties} file with sorted keys and no date comment, so the
+   * output is deterministic across runs with identical inputs.
    */
-  private String generateBuildNumber(int length) {
+  private void writePropertiesFile(Map<String, String> entries) throws MojoExecutionException {
+    File outputDir = new File(fileDirectory);
+    if (!outputDir.exists() && !outputDir.mkdirs()) {
+      throw new MojoExecutionException(
+          "Failed to create output directory: " + outputDir.getAbsolutePath());
+    }
+
+    File outputFile = new File(outputDir, fileName);
+    StringBuilder sb = new StringBuilder();
+    entries.forEach((k, v) -> sb.append(k).append('=').append(v).append('\n'));
+    String newContent = sb.toString();
+
+    try {
+      if (outputFile.exists()) {
+        String current = Files.readString(outputFile.toPath());
+        if (current.equals(newContent)) {
+          getLog().info("Build metadata unchanged at " + outputFile.getAbsolutePath());
+          return;
+        }
+      }
+      Files.writeString(outputFile.toPath(), newContent);
+    } catch (IOException e) {
+      throw new MojoExecutionException("Failed to write " + outputFile.getAbsolutePath(), e);
+    }
+
+    getLog().info("Build metadata written to " + outputFile.getAbsolutePath());
+  }
+
+  private String generateBuildNumber(int length) throws MojoExecutionException {
     try {
       String input =
           System.currentTimeMillis()
@@ -186,10 +198,9 @@ public class BuildMetadata extends AbstractMojo {
 
       MessageDigest digest = MessageDigest.getInstance("SHA-256");
       byte[] hash = digest.digest(input.getBytes());
-      String hex = HexFormat.of().formatHex(hash); // always 64 chars
-      return hex.substring(0, length);
+      return HexFormat.of().formatHex(hash).substring(0, length);
     } catch (NoSuchAlgorithmException e) {
-      throw new RuntimeException("SHA-256 not available", e);
+      throw new MojoExecutionException("SHA-256 not available", e);
     }
   }
 }
